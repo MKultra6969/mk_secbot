@@ -1,0 +1,11 @@
+services:
+  mk-secbot:
+    container_name: mk-secbot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["mk-secbot"]
+
