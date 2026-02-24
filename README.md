@@ -9,7 +9,7 @@ Telegram bot on Python (`aiogram`) for CrowdSec:
 ## 1. Requirements
 
 - Docker + Docker Compose plugin
-- CrowdSec Local API reachable from bot host (example: `http://192.168.1.27:8080`)
+- CrowdSec Local API reachable from bot host (example: `http://192.168.1.11:8080`)
 - Telegram bot token from `@BotFather`
 
 ## 2. CrowdSec machine credentials
@@ -94,16 +94,4 @@ Examples:
 ## 6. Security notes
 
 - Bot ignores any non-admin user without response.
-- Keep `.env` private and never commit it.
 - Restrict network access to CrowdSec API (firewall allowlist for bot host).
-
-## 7. GitHub publish
-
-```bash
-git init
-git add .
-git commit -m "Initial CrowdSec Telegram bot"
-git branch -M main
-git remote add origin <your_repo_url>
-git push -u origin main
-```
