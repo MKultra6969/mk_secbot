@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import deque
 from datetime import UTC, datetime, timedelta
 from html import escape as html_escape
@@ -12,6 +13,9 @@ from aiogram import Bot
 from mk_secbot.crowdsec import CrowdSecClient, CrowdSecError
 
 logger = logging.getLogger(__name__)
+
+_UNKNOWN_VALUES = {"", "-", "n/a", "none", "null", "unknown"}
+_LIST_CHANGE_RE = re.compile(r"update\s*:\s*(.+)", flags=re.IGNORECASE)
 
 
 class AlertWorker:
@@ -96,45 +100,157 @@ class AlertWorker:
 
 
 def format_alert_message(alert: dict[str, Any]) -> str:
-    alert_id = _escape(_read_alert_id(alert))
-    scenario = _escape(str(alert.get("scenario") or alert.get("name") or "unknown"))
-    source_ip = _escape(_read_source_ip(alert))
-    source_scope = _escape(_read_source_scope(alert))
-    country = _escape(_read_country(alert))
-    as_info = _escape(_read_as_info(alert))
-    reason = _escape(str(alert.get("message") or "unknown"))
-    created_at = _escape(
-        str(
-            alert.get("created_at")
-            or alert.get("createdAt")
-            or alert.get("start_at")
-            or "unknown"
-        )
-    )
+    alert_id = _read_alert_id(alert)
+    scenario = str(alert.get("scenario") or alert.get("name") or "unknown")
+    source_ip = _read_source_ip(alert)
+    source_scope = _read_source_scope(alert)
+    country = _read_country(alert)
+    as_info = _read_as_info(alert)
+    reason = str(alert.get("message") or "unknown")
+    created_at = _read_created_at(alert)
     decisions = alert.get("decisions")
     decision_count = len(decisions) if isinstance(decisions, list) else 0
-    events_count = _escape(
-        str(alert.get("events_count") or alert.get("eventsCount") or "unknown")
-    )
+    events_count = _read_events_count(alert)
 
+    if _is_list_scope(source_scope):
+        return _format_list_update_message(
+            alert_id=alert_id,
+            source_ip=source_ip,
+            source_scope=source_scope,
+            scenario=scenario,
+            reason=reason,
+            created_at=created_at,
+            decision_count=decision_count,
+        )
+
+    severity_emoji = _scenario_emoji(scenario)
     lines = [
-        "<b>CrowdSec alert</b>",
-        f"<b>ID:</b> <code>{alert_id}</code>",
-        f"<b>IP:</b> <code>{source_ip}</code>",
-        f"<b>Scope:</b> <code>{source_scope}</code>",
-        f"<b>Country:</b> <code>{country}</code>",
-        f"<b>AS:</b> <code>{as_info}</code>",
-        f"<b>Scenario:</b> <code>{scenario}</code>",
-        f"<b>Message:</b> <code>{reason}</code>",
-        f"<b>Created:</b> <code>{created_at}</code>",
-        f"<b>Events:</b> <code>{events_count}</code>",
-        f"<b>Decisions:</b> <code>{decision_count}</code>",
+        f"<b>{severity_emoji} CrowdSec Alert</b>",
     ]
+    if not _is_unknown(created_at):
+        lines.append(f"🕒 <code>{_escape(created_at)}</code>")
+        lines.append("")
+
+    lines.append(f"🎯 <b>Scenario:</b> <code>{_escape(scenario)}</code>")
+
+    source_line = f"🌐 <b>Source:</b> <code>{_escape(source_ip)}</code>"
+    if not _is_unknown(source_scope):
+        source_line = f"{source_line} (<code>{_escape(source_scope)}</code>)"
+    lines.append(source_line)
+
+    if not _is_unknown(country):
+        lines.append(f"📍 <b>Country:</b> <code>{_escape(country)}</code>")
+    if not _is_unknown(as_info):
+        lines.append(f"🏢 <b>AS:</b> <code>{_escape(as_info)}</code>")
+
+    events_label = events_count if not _is_unknown(events_count) else "n/a"
+    lines.append(f"📊 <b>Events / Decisions:</b> <code>{_escape(events_label)} / {decision_count}</code>")
+
+    if not _is_unknown(reason):
+        lines.append("")
+        lines.append(f"💬 {_escape(reason)}")
+
+    lines.append("")
+    lines.append(f"🆔 <b>ID:</b> <code>{_escape(alert_id)}</code>")
     return "\n".join(lines)
 
 
 def _escape(value: str) -> str:
     return html_escape(value, quote=False)
+
+
+def _is_unknown(value: str) -> bool:
+    return value.strip().lower() in _UNKNOWN_VALUES
+
+
+def _is_list_scope(scope: str) -> bool:
+    return scope.lower().startswith("lists:")
+
+
+def _read_created_at(alert: dict[str, Any]) -> str:
+    raw_value = (
+        alert.get("created_at")
+        or alert.get("createdAt")
+        or alert.get("start_at")
+        or "unknown"
+    )
+    value = str(raw_value).strip()
+    if _is_unknown(value):
+        return "unknown"
+    normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    return parsed.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _read_events_count(alert: dict[str, Any]) -> str:
+    for key in ("events_count", "eventsCount"):
+        value = alert.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    events = alert.get("events")
+    if isinstance(events, list):
+        return str(len(events))
+    return "unknown"
+
+
+def _format_list_update_message(
+    *,
+    alert_id: str,
+    source_ip: str,
+    source_scope: str,
+    scenario: str,
+    reason: str,
+    created_at: str,
+    decision_count: int,
+) -> str:
+    list_name = source_scope.split(":", maxsplit=1)[1] if ":" in source_scope else source_scope
+    change_summary = _extract_list_change(scenario=scenario, reason=reason)
+
+    lines = [
+        "<b>📚 CrowdSec List Update</b>",
+    ]
+    if not _is_unknown(created_at):
+        lines.append(f"🕒 <code>{_escape(created_at)}</code>")
+        lines.append("")
+
+    lines.append(f"🧾 <b>List:</b> <code>{_escape(list_name)}</code>")
+    if not _is_unknown(change_summary):
+        lines.append(f"🔄 <b>Changes:</b> <code>{_escape(change_summary)}</code>")
+    lines.append(f"🛡 <b>Decisions:</b> <code>{decision_count}</code>")
+    if decision_count <= 1 and not _is_unknown(source_ip):
+        lines.append(f"🌐 <b>Reference IP:</b> <code>{_escape(source_ip)}</code>")
+    lines.append("")
+    lines.append(f"🆔 <b>ID:</b> <code>{_escape(alert_id)}</code>")
+    return "\n".join(lines)
+
+
+def _extract_list_change(*, scenario: str, reason: str) -> str:
+    for value in (scenario, reason):
+        match = _LIST_CHANGE_RE.search(value)
+        if match:
+            return match.group(1).strip()
+    if not _is_unknown(scenario):
+        return scenario
+    if not _is_unknown(reason):
+        return reason
+    return "unknown"
+
+
+def _scenario_emoji(scenario: str) -> str:
+    scenario_lower = scenario.lower()
+    if "cve" in scenario_lower or "exploit" in scenario_lower:
+        return "🚨"
+    if "bruteforce" in scenario_lower or "scan" in scenario_lower:
+        return "⚠️"
+    return "🛡️"
 
 
 def _alert_key(alert: dict[str, Any]) -> str:
